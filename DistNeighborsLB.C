@@ -306,23 +306,23 @@ void DistNeighborsLB::LoadBalance() {
   // Determine if PE is overloaded.
   while (my_load > ub(avg_sys_load, kImbalanceFactor)) {
     // Choose who to send.
-    int receiver = ChooseReceiver();
+    std::pair<int,bool> receiver = ChooseReceiver();
 
     // Choose what to send. Removes task from data structures.
-    std::pair<int, double> task = ChooseLeavingTask(receiver);
+    std::pair<int, double> task = ChooseLeavingTask(receiver.first, receiver.second);
 
     // Commit migration.
     // AddToMigrationMessage(task.first, task.second, receiver);
     // In this implementation, migrations are being confirmed before commitment
 
     // Push migration.
-    thisProxy[receiver].IrradiateLoad(my_pe, task.first, my_load, task.second, 0);
+    thisProxy[receiver.first].IrradiateLoad(my_pe, task.first, my_load, task.second, 0);
 
     // Update local information.
     my_load -= task.second;
     total_migrates++;
-    if (neighbors.count(receiver)) {
-      neighbors[receiver].second += task.second;
+    if (neighbors.count(receiver.first)) {
+      neighbors[receiver.first].second += task.second;
     }
   }
   // Contribute for final reduction
