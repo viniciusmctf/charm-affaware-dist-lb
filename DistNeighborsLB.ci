@@ -5,13 +5,13 @@ module DistNeighborsLB {
 
   group [migratable] DistNeighborsLB : DistBaseLB {
     entry void DistNeighborsLB(const CkLBOptions &);
-    entry void CommunicateNeighborhood(int hwloc_id, int charm_id); // Used to generate logic topology
     entry void ShareNeighborLoad(int source, double load);
-    entry void IrradiateLoad(int from_pe, int remote_id, double pe_load, double load, int hop_count); // Comes commited
+    entry void IrradiateLoad(int from_pe, int remote_id, double pe_load, double task_load, int hop_count);
     entry void ReturnLoad(int source, double load);
-    entry void DenyLoad(int task, double load, bool deny);
+    entry void DenyLoad(int task, double load, int from_pe, double pe_load, bool deny);
     entry [reductiontarget] void AvgLoadReduction(double x);
     entry [reductiontarget] void DoneIrradiating();
+    entry [reductiontarget] void MigrateAfterBarrier();
 
   };
 

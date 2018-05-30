@@ -27,8 +27,7 @@ DistNeighborsLB::DistNeighborsLB(const CkLBOptions &opt) : CBase_DistNeighborsLB
   InitLB(opt);
 }
 
-void DistNeighborsLB::turnOn()
-{
+void DistNeighborsLB::turnOn() {
 #if CMK_LBDB_ON
   theLbdb->getLBDB()->
     TurnOnBarrierReceiver(receiver);
@@ -39,8 +38,7 @@ void DistNeighborsLB::turnOn()
 #endif
 }
 
-void DistNeighborsLB::turnOff()
-{
+void DistNeighborsLB::turnOff() {
 #if CMK_LBDB_ON
   theLbdb->getLBDB()->
     TurnOffBarrierReceiver(receiver);
@@ -66,12 +64,17 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
   kImbalanceFactor = 0.05;
   kMaxHops = -1; // only 1 hop allowed.
 
-  // Initialize data sets
-  stats->makeCommHash(); // Necessary in communication step
-  my_stats = stats;
+  // Initialize local lb data
   my_load = 0.0;
   neighbor_priority = 0.0;
   expected_ans = -1;
+  total_migrates = 0;
+  mig_acks = 0;
+  lb_started = false;
+  ending = false;
+
+  stats->makeCommHash(); // Necessary in communication step
+  my_stats = stats;
   task_load = std::vector<double>();
   global_task_id = std::vector<LDObjid>();
 
@@ -83,10 +86,7 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
     my_load += obj_load;
 
     if (obj_data.migratable && obj_load > 0.001) {
-      InfoRecord * info = new InfoRecord {i, obj_load};
-      // info->Id = i;
-      // info->load = obj_load;
-      tasks.push_back(info);
+      tasks.emplace(i, obj_load);
     }
   }
 
@@ -94,9 +94,8 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
   DefineNeighborhoodLoad(); // Updates expected_neighbor_load
   received_tasks.clear(); // = std::vector<std::pair<int,int> >(); // id, hop_count
   received_from.clear(); // = std::vector<int>();
-  // remote_comm_tasks = DefineRemoteCommTasks();
-  lb_started = false;
-  ending = false;
+  // remote_comm_tasks = DefineRemoteCommTasks(); // Determined by DefineNeighborhood
+
 }
 
 void DistNeighborsLB::DefineNeighborhood() {
@@ -263,9 +262,34 @@ int DistNeighborsLB::ChooseReceiver() {
   return rec;
 }
 
-std::pair<int, double> ChooseLeavingTask(int receiver) {
+std::pair<int, double> ChooseLeavingTask(int receiver, bool remote_comm) {
   std::pair<int, double> l_task;
+  bool choosing = true;
+  srand(CmiWallTimer()*receiver);
 
+  // Two behaviors:
+  // 1: There are remote_comm_tasks:
+  // If !remote_comm, there are no tasks to choose in remote_comm_tasks
+  if (remote_comm_tasks.size() && !remote_comm) {
+    auto iterator = remote_comm_tasks.begin();
+    while (choosing && iterator != remote_comm_tasks.end()) {
+      // If this remote_comm_task communicates with the chosen receiver,
+      if ((std::pair<int, int>)(*iterator).second == receiver) {
+        int position = (std::pair<int, int>)(*iterator).first;
+        l_task = tasks.at(position);
+        tasks.erase(position);
+        choosing = false;
+      }
+      iterator++;
+    }
+  }
+  // 2: There are no remote_comm_tasks that communicate with receiver:
+  if (choosing) {
+    int position = rand()%tasks.size();
+    l_task = tasks.at(position);
+    tasks.erase(position);
+    choosing = false;
+  }
 
   return l_task;
 }
@@ -275,30 +299,31 @@ void DistNeighborsLB::LoadBalance() {
   if (!lb_started) lb_started = true;
 
   // Determine if PE is overloaded.
-  if (my_load > ub(avg_sys_load, kImbalanceFactor)) {
-    while (my_load > ub(avg_sys_load, kImbalanceFactor)) {
-      // Choose who to send.
-      int receiver = ChooseReceiver();
+  while (my_load > ub(avg_sys_load, kImbalanceFactor)) {
+    // Choose who to send.
+    int receiver = ChooseReceiver();
 
-      // Choose what to send. Removes task from data structures.
-      std::pair<int, double> task = ChooseLeavingTask(receiver);
+    // Choose what to send. Removes task from data structures.
+    std::pair<int, double> task = ChooseLeavingTask(receiver);
 
-      // Commit migration.
-      AddToMigrationMessage(task.first, task.second, receiver);
+    // Commit migration.
+    // AddToMigrationMessage(task.first, task.second, receiver);
+    // In this implementation, migrations are being confirmed before commitment
 
-      // Push migration.
-      thisProxy[receiver].IrradiateLoad(my_pe, task.second, 0);
+    // Push migration.
+    thisProxy[receiver].IrradiateLoad(my_pe, task.first, my_load, task.second, 0);
 
-      // Update local information.
-      my_load -= task.second;
-      total_migrates++;
-      if (neighbors.count(receiver)) {
-        neighbors[receiver].second += task.second;
-      }
+    // Update local information.
+    my_load -= task.second;
+    total_migrates++;
+    if (neighbors.count(receiver)) {
+      neighbors[receiver].second += task.second;
     }
   }
   // Contribute for final reduction
-  if (!ending && !total_migrates) {
+  // 1. Case underloaded PE.
+  // 2. Case overloaded done receiving confirmations.
+  if (!ending && (!total_migrates || mig_acks == total_migrates)) {
     ending = true;
     contribute(CkCallback(
       CkReductionTarget(DistNeighborsLB, DoneIrradiating), thisProxy)
@@ -323,28 +348,70 @@ void DistNeighborsLB::IrradiateLoad(int from_pe, int remote_id, double pe_load, 
   // If task is to be rejected, give it back
   if (my_load+load > ub(avg_sys_load, kImbalanceFactor)) {
     migrations_expected--;
-    thisProxy[from_pe].DenyLoad(remote_id, load, true);
+    thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, true);
     LoadBalance();
   } else {
   // Accepted task
     received_from.push_back(from_pe);
     received_tasks.push_back(load);
     my_load += load;
-    thisProxy[from_pe].DenyLoad(remote_id, load, false);
+    thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, false);
     LoadBalance();
   }
 }
 
-void DistNeighborsLB::DenyLoad(int task_id, double task_load, bool deny) {
-  if (deny) {
-    my_load += task_load;
+// Updates migration message (migrateInfo) with task_id.
+void DistNeighborsLB::AddToMigrationMessage(int task_id, double task_load, int pe_id) {
+  MigrateInfo* migrating = new MigrateInfo;
+  migrating->obj = my_stats->objData[task_id].handle;
+  migrating->from_pe = my_pe;
+  migrating->to_pe = pe_id;
+  migrateInfo.push_back(migrating);
+}
 
+void DistNeighborsLB::DenyLoad(int task_id, double task_load, int remote_id, double remote_load, bool deny) {
+  // Update Remote node information
+  if (neighbors.count(remote_id)) {
+    neighbors.emplace(remote_id, remote_load);
+  } else {
+    remotes.emplace(remote_id, remote_load);
   }
+
+  // Reinsert denied task in data structures.
+  if (deny) {
+    // Update local information.
+    my_load += task_load;
+    tasks.emplace(task_id, task_load);
+
+  } else {
+    // If not denied, add migration message.
+    AddToMigrationMessage(task_id, task_load, remote_id);
+    mig_acks++;
+  }
+
+  // Go back to load balance decision.
+  LoadBalance();
 }
 
 void DistNeighborsLB::DoneIrradiating() {
+  // Create Final migration message.
+  msg = new(total_migrates, CkNumPes(), CkNumPes(), 0) LBMigrateMsg;
+  msg->n_moves = total_migrates;
+  for (int i = 0; i < total_migrates; ++i) {
+    MigrateInfo* item = (MigrateInfo*) migrateInfo[i];
+    msg->moves[i] = *item;
+    delete item;
+    migrateInfo[i] = 0;
+  }
+  migrateInfo.clear();
 
+  // Synchronize to start actual migrations.
+  contribute(CkCallback(
+    CkReductionTarget(DistNeighborsLB, MigrateAfterBarrier), thisProxy));
 }
 
+void DistNeighborsLB::MigrateAfterBarrier() {
+  ProcessMigrationDecision(msg);
+}
 
 #include "DistNeighborsLB.def.h"
