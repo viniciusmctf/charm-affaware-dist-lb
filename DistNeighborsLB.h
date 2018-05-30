@@ -55,8 +55,8 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    std::vector<MigrateInfo*> migrateInfo;
    LBMigrateMsg* msg;
 
-   int ChooseReceiver();
-   std::pair<int,double> ChooseLeavingTask(int rec);
+   std::pair<int, bool> ChooseReceiver(); // Chosen receiver, remote stat 
+   std::pair<int,double> ChooseLeavingTask(int rec, bool remote_comm);
 
    void InitLB(const CkLBOptions &);
    void DefineNeighborhood();

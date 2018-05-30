@@ -230,8 +230,9 @@ void DistNeighborsLB::GlobalReschedule() {
   LoadBalance();
 }
 
-int DistNeighborsLB::ChooseReceiver() {
+std::pair<int, bool> DistNeighborsLB::ChooseReceiver() {
   int rec;
+  bool remote;
   srand(CmiWallTimer()*neighbor_priority);
 
   // If the neighborhood has an OL factor higher than 5%
@@ -240,6 +241,7 @@ int DistNeighborsLB::ChooseReceiver() {
     do {
       rec = rand()%CkNumPes();
     } while (neighbors.count(rec) || rec == my_pe);
+    remote = true;
 
   // If neighborhood has an UL factor higher than 5%
   // Migrate in.
@@ -250,6 +252,7 @@ int DistNeighborsLB::ChooseReceiver() {
       iterator++;
     }
     rec = ((std::pair<int,double>)(*iterator)).first;
+    remote = false;
 
   // If near balance neighborhood, pick a PE at random (not self)
   // To increase convergence rate.
@@ -257,9 +260,11 @@ int DistNeighborsLB::ChooseReceiver() {
     do {
       rec = rand()%CkNumPes();
     } while (rec == my_pe);
+    // Assume remote comm, for cheaper task choosing step:
+    remote = true;
   }
 
-  return rec;
+  return {rec, remote};
 }
 
 std::pair<int, double> ChooseLeavingTask(int receiver, bool remote_comm) {
