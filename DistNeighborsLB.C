@@ -5,15 +5,97 @@
 
 #include "DistNeighborsLB.h"
 #include "elements.h"
-#include "lbdb.h"
+#include "DistBaseLB.h"
+#include "BaseLB.h"
 #include "ckgraph.h"
 
+#include <sstream>
 #include <string>
 
 #define AFFINITY_ON 1
 #define DIST_LBDBG_ON _lb_args.debug()
 #define ub(x,y) (1+y)*x
 
+namespace util_math {
+  const static unsigned int doublingPrimes[] = {
+    3,
+    7,
+    17,
+    37,
+    73,
+    157,
+    307,
+    617,
+    1217,
+    2417,
+    4817,
+    9677,
+    20117,
+    40177,
+    80177,
+    160117,
+    320107,
+    640007,
+    1280107,
+    2560171,
+    5120117,
+    10000079,
+    20000077,
+    40000217,
+    80000111,
+    160000177,
+    320000171,
+    640000171,
+    1280000017,
+    2560000217u,
+    4200000071u
+/* extra primes larger than an unsigned 32-bit integer:
+51200000077,
+100000000171,
+200000000171,
+400000000171,
+800000000117,
+1600000000021,
+3200000000051,
+6400000000081,
+12800000000003,
+25600000000021,
+51200000000077,
+100000000000067,
+200000000000027,
+400000000000063,
+800000000000017,
+1600000000000007,
+3200000000000059,
+6400000000000007,
+12800000000000009,
+25600000000000003,
+51200000000000023,
+100000000000000003,
+200000000000000003,
+400000000000000013,
+800000000000000119,
+1600000000000000031,
+3200000000000000059 //This is a 62-bit number
+*/
+};
+
+static inline int i_abs(int c) { return c>0?c:-c; }
+
+//This routine returns an arbitrary prime larger than x
+static unsigned int primeLargerThan(unsigned int x) {
+	 int i=0;
+	 while (doublingPrimes[i]<=x) i++;
+	 return doublingPrimes[i];
+  }
+}
+
+inline static int ObjKey(const LDObjid &oid, const int hashSize) {
+  // make sure all positive
+  return (((util_math::i_abs(oid.id[2]) & 0x7F)<<24)
+	 |((util_math::i_abs(oid.id[1]) & 0xFF)<<16)
+	 |util_math::i_abs(oid.id[0])) % hashSize;
+}
 
 CreateLBFunc_Def(DistNeighborsLB, "Locality based decentralized load balancer")
 
@@ -73,10 +155,11 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
   lb_started = false;
   ending = false;
 
-  stats->makeCommHash(); // Necessary in communication step
   my_stats = stats;
-  task_load = std::vector<double>();
-  global_task_id = std::vector<LDObjid>();
+
+  hash_size = 0;
+
+  // MakeCommHash(my_stats); // Necessary in communication step
 
   // Update local load informations
   int n_tasks = my_stats->n_objs;
@@ -98,15 +181,84 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
 
 }
 
+// Create Charm_ID Hash table, as seen in BaseLB
+void DistNeighborsLB::MakeCommHash() {
+  // hash table is already build
+  if (obj_hash) return;
+
+  int i;
+  hash_size = my_stats->n_objs*2;
+  hash_size = util_math::primeLargerThan(hash_size);
+  obj_hash = new int[hash_size];
+  for (i = 0; i < hash_size; i++) {
+    obj_hash[i] = -1;
+  }
+
+  for (i = 0; i < my_stats->n_objs; i++) {
+    const LDObjid &oid = my_stats->objData[i].objID();
+    int hash = ObjKey(oid, hash_size);
+    CmiAssert(hash != -1);
+
+    while(obj_hash[hash] != -1)
+      hash = (hash+1)%hash_size;
+
+    obj_hash[hash] = i;
+  }
+}
+
+void DistNeighborsLB::DeleteCommHash() {
+  if (obj_hash) delete [] obj_hash;
+
+  obj_hash = NULL;
+  for(int i=0; i < my_stats->n_comm; i++) {
+    my_stats->commData[i].clearHash();
+  }
+}
+
+int DistNeighborsLB::GetObjHash(const LDObjid &oid, const LDOMid &mid) {
+  #if CMK_LBDB_ON
+    CmiAssert(hash_size > 0);
+    int hash = ObjKey(oid, hash_size);
+
+    for (int id = 0; id < hash_size; id++) {
+      int index = (id+hash)%hash_size;
+	     if (index == -1 || obj_hash[index] == -1) return -1;
+
+      if (LDObjIDEqual(my_stats->objData[obj_hash[index]].objID(), oid) &&
+            LDOMidEqual(my_stats->objData[obj_hash[index]].omID(), mid))
+            return obj_hash[index];
+    }
+    //  CkPrintf("not found \n");
+  #endif
+    return -1;
+}
+
+int DistNeighborsLB::GetObjHash(const LDObjKey &key) {
+  const LDObjid &oid = key.objID();
+  const LDOMid  &mid = key.omID();
+  return GetObjHash(oid, mid);
+}
+
+int DistNeighborsLB::GetSendHash(const LDCommData &c_data) {
+  return GetObjHash(c_data.sender);
+}
+
+int DistNeighborsLB::GetRecvHash(const LDCommData &c_data) {
+  return GetObjHash(c_data.receiver.get_destObj());
+}
+
 void DistNeighborsLB::DefineNeighborhood() {
   // Neighbors are defined only once.
   if (defined_neighbors && !kRedefineNeighborhood) return;
 
   // Reset dataset
-  neighbors = std::set<int>();
+  neighbors.clear();
+
+  // Define obj_hash, a list of all objects associated to their CharmIDs
+  MakeCommHash();
 
   // Neighborhood is defined based on task communication.
-  LDCommData &comm_data = my_stats->commData;
+  LDCommData* comm_data = (my_stats->commData);
   int max_iter = my_stats->n_comm;
 
   auto start_time = CmiWallTimer();
@@ -116,7 +268,7 @@ void DistNeighborsLB::DefineNeighborhood() {
     if (comm_data[i].recv_type() == LD_OBJ_MSG) {
 
       const LDCommDesc& to = comm_data[i].receiver;
-      int comm_pe = to.destObjProc;
+      int comm_pe = to.dest.destObj.destObjProc;
 
       // Case local communication
       if (my_pe == comm_pe) {
@@ -131,7 +283,7 @@ void DistNeighborsLB::DefineNeighborhood() {
 
         #if AFFINITY_ON
         // Get CommHash to assign remote_comm_tasks
-        int t_id = my_stats->getHash(comm_data[i].sender);
+        int t_id = GetObjHash(comm_data[i].sender);
         if (DIST_LBDBG_ON > 1)
           CkPrintf("[%d] Communicating task is: %d", my_pe, t_id);
         remote_comm_tasks.emplace(t_id, comm_pe);
@@ -144,12 +296,13 @@ void DistNeighborsLB::DefineNeighborhood() {
 
   // Debug information on defined neighborhoods.
   if (DIST_LBDBG_ON) {
-    std::string db_neighbors();
+    std::stringstream db_neighbors;
+    db_neighbors.str("");
     for (auto e : neighbors) {
-      db_neighbors << e << ", ";
+      db_neighbors << std::to_string(e.first) << ", ";
     }
     db_neighbors << std::endl;
-    CkPrintf("[%d] Defined neighborhood: %s\n", my_pe, db_neighbors);
+    CkPrintf("[%d] Defined neighborhood: %s\n", my_pe, db_neighbors.str());
   }
   CkPrintf("[%d] Time elapsed: %lf", my_pe, time_to_define);
   defined_neighbors = true;
@@ -158,7 +311,7 @@ void DistNeighborsLB::DefineNeighborhood() {
 
 void DistNeighborsLB::DefineNeighborhoodLoad() {
   expected_ans = 0;
-  for (n : neighbors) {
+  for (auto n : neighbors) {
     thisProxy[n.first].ShareNeighborLoad(my_pe, my_load);
     expected_ans++;
   }
@@ -173,7 +326,7 @@ void DistNeighborsLB::UpdateMinNeighbor(int source, double load) {
 }
 
 void DistNeighborsLB::ReturnLoad(int source, double load) {
-  neighbors[source].second = load;
+  neighbors[source] = load;
   expected_ans--;
 
   // UpdateMinNeighbor(source, load);
@@ -187,11 +340,11 @@ void DistNeighborsLB::ReturnLoad(int source, double load) {
 void DistNeighborsLB::ShareNeighborLoad(int source, double load) {
   // Not an expected ans
   if (!neighbors.count(source)) {
-    thisProxy[source].ReturnLoad(int source, double load);
+    thisProxy[source].ReturnLoad(source, load);
     neighbors.emplace(source, load);
   } else {
     expected_ans--;
-    neighbors[source].second = load;
+    neighbors[source] = load;
   }
 
   // UpdateMinNeighbor(source, load);
@@ -210,12 +363,12 @@ void DistNeighborsLB::AvgLoadReduction(double x) {
 
   double avg_nbr_load = 0.0;
   int negack = 0;
-  for (n : neighbors) {
+  for (auto n : neighbors) {
     avg_nbr_load += n.second;
   }
   avg_nbr_load /= neighbors.size();
   if (DIST_LBDBG_ON > 1) {
-    CkPrintf("[%d] I had a total of %d missing neighbors.\n", )
+    // CkPrintf("[%d] I had a total of %d missing neighbors.\n", my_pe, );
   }
 
   // > 1: Do not make neighborhood migration
@@ -267,7 +420,7 @@ std::pair<int, bool> DistNeighborsLB::ChooseReceiver() {
   return {rec, remote};
 }
 
-std::pair<int, double> ChooseLeavingTask(int receiver, bool remote_comm) {
+std::pair<int, double> DistNeighborsLB::ChooseLeavingTask(int receiver, bool remote_comm) {
   std::pair<int, double> l_task;
   bool choosing = true;
   srand(CmiWallTimer()*receiver);
@@ -279,19 +432,20 @@ std::pair<int, double> ChooseLeavingTask(int receiver, bool remote_comm) {
     auto iterator = remote_comm_tasks.begin();
     while (choosing && iterator != remote_comm_tasks.end()) {
       // If this remote_comm_task communicates with the chosen receiver,
-      if ((std::pair<int, int>)(*iterator).second == receiver) {
-        int position = (std::pair<int, int>)(*iterator).first;
-        l_task = tasks.at(position);
+      if ((*iterator).second == receiver) {
+        int position = (*iterator).first;
+        l_task = {position, tasks.at(position)};
         tasks.erase(position);
         choosing = false;
+      } else {
+        iterator++;
       }
-      iterator++;
     }
   }
   // 2: There are no remote_comm_tasks that communicate with receiver:
   if (choosing) {
     int position = rand()%tasks.size();
-    l_task = tasks.at(position);
+    l_task = {position, tasks.at(position)};
     tasks.erase(position);
     choosing = false;
   }
@@ -322,7 +476,7 @@ void DistNeighborsLB::LoadBalance() {
     my_load -= task.second;
     total_migrates++;
     if (neighbors.count(receiver.first)) {
-      neighbors[receiver.first].second += task.second;
+      neighbors[receiver.first] += task.second;
     }
   }
   // Contribute for final reduction
@@ -338,7 +492,7 @@ void DistNeighborsLB::LoadBalance() {
 
 void DistNeighborsLB::IrradiateLoad(int from_pe, int remote_id, double pe_load, double load, int hop_count) {
   // Update number of expected received migrations for base class (DistLB)
-  migrations_expected++;
+  migrates_expected++;
 
   // Not a neighbor
   if (!neighbors.count(from_pe)) {
@@ -347,18 +501,18 @@ void DistNeighborsLB::IrradiateLoad(int from_pe, int remote_id, double pe_load, 
     }
     remotes.emplace(from_pe, pe_load);
   } else {
-    neighbors[from_pe].second = pe_load;
+    neighbors[from_pe] = pe_load;
   }
 
   // If task is to be rejected, give it back
   if (my_load+load > ub(avg_sys_load, kImbalanceFactor)) {
-    migrations_expected--;
+    migrates_expected--;
     thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, true);
     LoadBalance();
   } else {
   // Accepted task
     received_from.push_back(from_pe);
-    received_tasks.push_back(load);
+    received_tasks.push_back({remote_id, load});
     my_load += load;
     thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, false);
     LoadBalance();

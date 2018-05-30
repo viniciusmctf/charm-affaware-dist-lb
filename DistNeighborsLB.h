@@ -20,6 +20,7 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    void ReturnLoad(int source, double load);
    void AvgLoadReduction(double x);
    void IrradiateLoad(int from_pe, int remote_id, double pe_load, double load, int hop_count);
+   void DenyLoad(int, double, int, double, bool);
    void DoneIrradiating();
    void MigrateAfterBarrier();
 
@@ -27,6 +28,7 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    CProxy_DistNeighborsLB thisProxy;
 
    // Constants
+   int kMaxHops;
    bool kRedefineNeighborhood;
    double kImbalanceFactor;
    double kCommunicationFactor;
@@ -43,9 +45,13 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    double avg_sys_load;
    double neighbor_priority;
 
+   // Emulate BaseLB::LDStats::*Hash functions
+   int* obj_hash;
+   int hash_size;
+
    std::map<int,double> neighbors;
    std::map<int,double> remotes;
-   std::vector<std::pair<int,int> > received_tasks;
+   std::vector<std::pair<int,double> > received_tasks; // Id, load
    std::vector<int> received_from;
    std::map<int,int> remote_comm_tasks; // Prime targets for migration (task,pe)
    std::pair<int,double> min_neighbor_load;
@@ -55,13 +61,21 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    std::vector<MigrateInfo*> migrateInfo;
    LBMigrateMsg* msg;
 
-   std::pair<int, bool> ChooseReceiver(); // Chosen receiver, remote stat 
+   std::pair<int, bool> ChooseReceiver(); // Chosen receiver, remote stat
    std::pair<int,double> ChooseLeavingTask(int rec, bool remote_comm);
 
    void InitLB(const CkLBOptions &);
    void DefineNeighborhood();
+   void DefineNeighborhoodLoad();
+   void MakeCommHash();
+   void DeleteCommHash();
+   int GetObjHash(const LDObjid &oid, const LDOMid &mid);
+   int GetObjHash(const LDObjKey &key);
+   int GetSendHash(const LDCommData &c_data);
+   int GetRecvHash(const LDCommData &c_data);
    void DefineRemoteCommTasks();
    void UpdateMinNeighbor(int source, double load);
+   void AddToMigrationMessage(int, double, int);
    void LocalRemote(int i, const LDObjid& from, const LDObjid& to);
    void LoadBalance();
    void GlobalReschedule();
