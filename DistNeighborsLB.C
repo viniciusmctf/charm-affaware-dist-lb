@@ -143,8 +143,12 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
 
   // Initialize constants
   kRedefineNeighborhood = false;
+  kDynamicNeighborhood = true;
   kImbalanceFactor = 0.05;
   kMaxHops = -1; // only 1 hop allowed.
+
+  // Initialize topology // LAPESD-TESLA
+  topo = archtopo::comm_topo(1, 2, 10, 2);
 
   // Initialize local lb data
   my_load = 0.0;
@@ -163,6 +167,7 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
 
   // Update local load informations
   int n_tasks = my_stats->n_objs;
+  tasks.clear();
   for (int i = 0; i < n_tasks; ++i) {
     auto obj_data = my_stats->objData[i];
     double obj_load = obj_data.wallTime;
@@ -173,10 +178,11 @@ void DistNeighborsLB::Strategy(const DistBaseLB::LDStats* const stats) {
     }
   }
 
-  DefineNeighborhood(); // Updates neighbors
-  DefineNeighborhoodLoad(); // Updates expected_neighbor_load
   received_tasks.clear(); // = std::vector<std::pair<int,int> >(); // id, hop_count
   received_from.clear(); // = std::vector<int>();
+  sent_tasks.clear();
+  DefineNeighborhood(); // Updates neighbors
+  DefineNeighborhoodLoad(); // Updates expected_neighbor_load
   // remote_comm_tasks = DefineRemoteCommTasks(); // Determined by DefineNeighborhood
 
 }
@@ -254,57 +260,62 @@ void DistNeighborsLB::DefineNeighborhood() {
   // Reset dataset
   neighbors.clear();
 
-  // Define obj_hash, a list of all objects associated to their CharmIDs
-  MakeCommHash();
+  if (kDynamicNeighborhood) {
+    // Define obj_hash, a list of all objects associated to their CharmIDs
+    MakeCommHash();
 
-  // Neighborhood is defined based on task communication.
-  LDCommData* comm_data = (my_stats->commData);
-  int max_iter = my_stats->n_comm;
+    // Neighborhood is defined based on task communication.
+    LDCommData* comm_data = (my_stats->commData);
+    int max_iter = my_stats->n_comm;
 
-  auto start_time = CmiWallTimer();
-  // For every registered communication
-  for (int i = 0; i < max_iter; ++i) {
-    // Considering only communication between objects
-    if (comm_data[i].recv_type() == LD_OBJ_MSG) {
+    auto start_time = CmiWallTimer();
+    // For every registered communication
+    for (int i = 0; i < max_iter; ++i) {
+      // Considering only communication between objects
+      if (comm_data[i].recv_type() == LD_OBJ_MSG) {
 
-      const LDCommDesc& to = comm_data[i].receiver;
-      int comm_pe = to.dest.destObj.destObjProc;
+        const LDCommDesc& to = comm_data[i].receiver;
+        int comm_pe = to.dest.destObj.destObjProc;
 
-      // Case local communication
-      if (my_pe == comm_pe) {
-        // If the current PE is the receiver, we'll do nothing.
-        continue;
-      } else {
-        if (DIST_LBDBG_ON > 1) {
-          CkPrintf("[%d] Detected communication to: %d\n", my_pe, comm_pe);
+        // Case local communication
+        if (my_pe == comm_pe) {
+          // If the current PE is the receiver, we'll do nothing.
+          continue;
+        } else {
+          if (DIST_LBDBG_ON > 4) {
+            CkPrintf("[%d] Detected communication to: %d\n", my_pe, comm_pe);
+          }
+          // This is no local communication, so we'll add comm_pe to our neighborhood.
+          neighbors.emplace(comm_pe, 0);
+
+          #if AFFINITY_ON
+          // Get CommHash to assign remote_comm_tasks
+          int t_id = GetObjHash(comm_data[i].sender);
+          if (DIST_LBDBG_ON > 4)
+            CkPrintf("[%d] Communicating task is: %d\n", my_pe, t_id);
+          remote_comm_tasks.emplace(t_id, comm_pe);
+          #endif //AFFINITY
         }
-        // This is no local communication, so we'll add comm_pe to our neighborhood.
-        neighbors.emplace(comm_pe, -1);
-
-        #if AFFINITY_ON
-        // Get CommHash to assign remote_comm_tasks
-        int t_id = GetObjHash(comm_data[i].sender);
-        if (DIST_LBDBG_ON > 1)
-          CkPrintf("[%d] Communicating task is: %d", my_pe, t_id);
-        remote_comm_tasks.emplace(t_id, comm_pe);
-        #endif //AFFINITY
       }
     }
-  }
-  auto end_time = CmiWallTimer();
-  auto time_to_define = end_time - start_time;
+    auto end_time = CmiWallTimer();
+    auto time_to_define = end_time - start_time;
 
-  // Debug information on defined neighborhoods.
-  if (DIST_LBDBG_ON) {
-    std::stringstream db_neighbors;
-    db_neighbors.str("");
-    for (auto e : neighbors) {
-      db_neighbors << std::to_string(e.first) << ", ";
+    // Debug information on defined neighborhoods.
+    if (DIST_LBDBG_ON > 2) {
+      for (auto e : neighbors) {
+        CkPrintf("[%d] Chosen neighbor: %d\n", my_pe, e.first);
+      }
     }
-    db_neighbors << std::endl;
-    CkPrintf("[%d] Defined neighborhood: %s\n", my_pe, db_neighbors.str());
+    CkPrintf("[%d] Time elapsed: %lf\n", my_pe, time_to_define);
+  } else {
+    // Use topo if cannot dynamically define neighborhood
+    auto tmp = topo.neighbors(my_pe, 2);
+    for (auto e : tmp) {
+      neighbors.emplace(e, 0);
+    }
   }
-  CkPrintf("[%d] Time elapsed: %lf", my_pe, time_to_define);
+
   defined_neighbors = true;
   return;
 }
@@ -312,6 +323,9 @@ void DistNeighborsLB::DefineNeighborhood() {
 void DistNeighborsLB::DefineNeighborhoodLoad() {
   expected_ans = 0;
   for (auto n : neighbors) {
+    if (DIST_LBDBG_ON > 2) {
+      CkPrintf("[%d] Sharing load (%lf) with neighbor %d\n", my_pe, my_load, n.first);
+    }
     thisProxy[n.first].ShareNeighborLoad(my_pe, my_load);
     expected_ans++;
   }
@@ -326,7 +340,7 @@ void DistNeighborsLB::UpdateMinNeighbor(int source, double load) {
 }
 
 void DistNeighborsLB::ReturnLoad(int source, double load) {
-  neighbors[source] = load;
+  neighbors.emplace(source, load);
   expected_ans--;
 
   // UpdateMinNeighbor(source, load);
@@ -338,12 +352,19 @@ void DistNeighborsLB::ReturnLoad(int source, double load) {
 }
 
 void DistNeighborsLB::ShareNeighborLoad(int source, double load) {
+  if (DIST_LBDBG_ON > 2) {
+    CkPrintf("[%d] Receiving load from neighbor %d\n", my_pe, source);
+  }
   // Not an expected ans
   if (!neighbors.count(source)) {
+    // Share load, since we've not shared beforehand
     thisProxy[source].ReturnLoad(source, load);
+    // Add to neighbors
     neighbors.emplace(source, load);
   } else {
+    // Decrease #expected responses
     expected_ans--;
+    // Update neighbor load
     neighbors[source] = load;
   }
 
@@ -363,12 +384,17 @@ void DistNeighborsLB::AvgLoadReduction(double x) {
 
   double avg_nbr_load = 0.0;
   int negack = 0;
+  if (DIST_LBDBG_ON > 2) {
+    CkPrintf("[%d] I have found %d neighbors\n", my_pe, neighbors.size());
+  }
   for (auto n : neighbors) {
+    if (DIST_LBDBG_ON > 1)
+      CkPrintf("[%d] Load is (%d = %lf)\n", my_pe, n.first, n.second);
     avg_nbr_load += n.second;
   }
   avg_nbr_load /= neighbors.size();
   if (DIST_LBDBG_ON > 1) {
-    // CkPrintf("[%d] I had a total of %d missing neighbors.\n", my_pe, );
+      CkPrintf("[%d] My average neighbor load was %lf\n", my_pe, avg_nbr_load);
   }
 
   // > 1: Do not make neighborhood migration
@@ -388,6 +414,11 @@ std::pair<int, bool> DistNeighborsLB::ChooseReceiver() {
   bool remote;
   srand(CmiWallTimer()*neighbor_priority);
 
+  if(DIST_LBDBG_ON > 2) {
+    CkPrintf("[%d] Choosing receiver, current neighborhood OL factor is: %lf\n",
+      my_pe, neighbor_priority);
+  }
+
   // If the neighborhood has an OL factor higher than 5%
   // Migrate out.
   if (neighbor_priority > 1.05) {
@@ -399,7 +430,10 @@ std::pair<int, bool> DistNeighborsLB::ChooseReceiver() {
   // If neighborhood has an UL factor higher than 5%
   // Migrate in.
   } else if (neighbor_priority < 0.95) {
+    if (neighbors.count(my_pe))
+      neighbors.erase(my_pe);
     int it_count = rand()%neighbors.size();
+
     auto iterator = neighbors.begin();
     for (int i = 0; i > it_count; ++i) {
       iterator++;
@@ -417,6 +451,10 @@ std::pair<int, bool> DistNeighborsLB::ChooseReceiver() {
     remote = true;
   }
 
+  if (DIST_LBDBG_ON > 2) {
+    CkPrintf("[%d] Chosen receiver was: %d\n", my_pe, rec);
+  }
+
   return {rec, remote};
 }
 
@@ -432,10 +470,16 @@ std::pair<int, double> DistNeighborsLB::ChooseLeavingTask(int receiver, bool rem
     auto iterator = remote_comm_tasks.begin();
     while (choosing && iterator != remote_comm_tasks.end()) {
       // If this remote_comm_task communicates with the chosen receiver,
-      if ((*iterator).second == receiver) {
+      if ((*iterator).second == receiver && !sent_tasks.count((*iterator).first)) {
         int position = (*iterator).first;
-        l_task = {position, tasks.at(position)};
+        l_task = {position, tasks.at(position)}; // Not working, bro
+        sent_tasks.emplace(position, receiver);
         tasks.erase(position);
+        remote_comm_tasks.erase(iterator);
+
+        if (DIST_LBDBG_ON > 2) {
+          CkPrintf("[%d] Choosing and erasing task %d\n", my_pe, position);
+        }
         choosing = false;
       } else {
         iterator++;
@@ -445,18 +489,29 @@ std::pair<int, double> DistNeighborsLB::ChooseLeavingTask(int receiver, bool rem
   // 2: There are no remote_comm_tasks that communicate with receiver:
   if (choosing) {
     int position = rand()%tasks.size();
-    l_task = {position, tasks.at(position)};
+    while (sent_tasks.count(position)) {
+      position = rand()%tasks.size();
+    }
+    auto it = tasks.begin();
+    for (int i = 0; i < position; ++i) {
+      it++;
+    }
+    l_task = {(*it).first, (*it).second};
+    if (remote_comm_tasks.count(position)) {
+      remote_comm_tasks.erase(position);
+    }
+    sent_tasks.emplace(position, receiver);
     tasks.erase(position);
+    if (DIST_LBDBG_ON > 2) {
+      CkPrintf("[%d] Choosing and erasing task %d\n", my_pe, position);
+    }
     choosing = false;
   }
 
   return l_task;
 }
 
-void DistNeighborsLB::LoadBalance() {
-  // Start LB
-  if (!lb_started) lb_started = true;
-
+void DistNeighborsLB::SendLoad(int hops) {
   // Determine if PE is overloaded.
   while (my_load > ub(avg_sys_load, kImbalanceFactor)) {
     // Choose who to send.
@@ -470,7 +525,7 @@ void DistNeighborsLB::LoadBalance() {
     // In this implementation, migrations are being confirmed before commitment
 
     // Push migration.
-    thisProxy[receiver.first].IrradiateLoad(my_pe, task.first, my_load, task.second, 0);
+    thisProxy[receiver.first].IrradiateLoad(my_pe, task.first, my_load, task.second, hops);
 
     // Update local information.
     my_load -= task.second;
@@ -479,6 +534,14 @@ void DistNeighborsLB::LoadBalance() {
       neighbors[receiver.first] += task.second;
     }
   }
+}
+
+void DistNeighborsLB::LoadBalance() {
+  // Start LB
+  if (!lb_started) lb_started = true;
+
+  SendLoad(0);
+
   // Contribute for final reduction
   // 1. Case underloaded PE.
   // 2. Case overloaded done receiving confirmations.
@@ -487,17 +550,20 @@ void DistNeighborsLB::LoadBalance() {
     contribute(CkCallback(
       CkReductionTarget(DistNeighborsLB, DoneIrradiating), thisProxy)
     );
+  } else {
+    if (DIST_LBDBG_ON > 2) {
+      CkPrintf("[%d] Still waiting for %d to finish\n", my_pe, total_migrates-mig_acks);
+    }
   }
 }
 
 void DistNeighborsLB::IrradiateLoad(int from_pe, int remote_id, double pe_load, double load, int hop_count) {
   // Update number of expected received migrations for base class (DistLB)
-  migrates_expected++;
 
   // Not a neighbor
   if (!neighbors.count(from_pe)) {
     if (DIST_LBDBG_ON > 1) {
-      CkPrintf("[%d] I am receiveing a remote migration!\n", my_pe);
+      CkPrintf("[%d] I am receiveing a remote migration: (%d -> %lf)\n", my_pe, from_pe, pe_load);
     }
     remotes.emplace(from_pe, pe_load);
   } else {
@@ -505,15 +571,21 @@ void DistNeighborsLB::IrradiateLoad(int from_pe, int remote_id, double pe_load, 
   }
 
   // If task is to be rejected, give it back
-  if (my_load+load > ub(avg_sys_load, kImbalanceFactor)) {
-    migrates_expected--;
+  if (my_load+load > ub(avg_sys_load, kImbalanceFactor) && hop_count < 1) {
+    if (DIST_LBDBG_ON > 1) {
+      CkPrintf("[%d] I am denying a task: (%d -> %lf)\n", my_pe, remote_id, load);
+    }
     thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, true);
     LoadBalance();
   } else {
   // Accepted task
+    migrates_expected++;
+    if (DIST_LBDBG_ON > 1) {
+      CkPrintf("[%d] I am receiveing a task: (%d -> %lf)\n", my_pe, remote_id, load);
+    }
     received_from.push_back(from_pe);
     received_tasks.push_back({remote_id, load});
-    my_load += load;
+    // my_load += load;
     thisProxy[from_pe].DenyLoad(remote_id, load, my_pe, my_load, false);
     LoadBalance();
   }
@@ -531,7 +603,7 @@ void DistNeighborsLB::AddToMigrationMessage(int task_id, double task_load, int p
 void DistNeighborsLB::DenyLoad(int task_id, double task_load, int remote_id, double remote_load, bool deny) {
   // Update Remote node information
   if (neighbors.count(remote_id)) {
-    neighbors.emplace(remote_id, remote_load);
+    neighbors[remote_id] = remote_load;
   } else {
     remotes.emplace(remote_id, remote_load);
   }
@@ -540,15 +612,27 @@ void DistNeighborsLB::DenyLoad(int task_id, double task_load, int remote_id, dou
   if (deny) {
     // Update local information.
     my_load += task_load;
-    tasks.emplace(task_id, task_load);
+    if (DIST_LBDBG_ON > 2)
+      CkPrintf("[%d] Task of ID %d has been denied\n", my_pe, task_id);
+    // tasks.emplace(task_id, task_load);
+    total_migrates--;
+    DesperateLoadBalance();
 
   } else {
     // If not denied, add migration message.
+    if (DIST_LBDBG_ON > 2)
+      CkPrintf("[%d] Task of ID %d has been confirmed\n", my_pe, task_id);
+
     AddToMigrationMessage(task_id, task_load, remote_id);
     mig_acks++;
   }
 
   // Go back to load balance decision.
+  LoadBalance();
+}
+
+void DistNeighborsLB::DesperateLoadBalance() {
+  SendLoad(1);
   LoadBalance();
 }
 

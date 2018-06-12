@@ -3,6 +3,7 @@
 
 #include "DistBaseLB.h"
 #include "DistNeighborsLB.decl.h"
+#include "archtopo.h"
 #include <vector>
 #include <set>
 #include <map>
@@ -30,8 +31,12 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    // Constants
    int kMaxHops;
    bool kRedefineNeighborhood;
+   bool kDynamicNeighborhood;
    double kImbalanceFactor;
    double kCommunicationFactor;
+
+   // Topology
+   archtopo::comm_topo topo;
 
    // Local Variables
    bool lb_started; // Used by base class to finish LB.
@@ -55,7 +60,8 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    std::vector<int> received_from;
    std::map<int,int> remote_comm_tasks; // Prime targets for migration (task,pe)
    std::pair<int,double> min_neighbor_load;
-   std::unordered_map<int, double> tasks; // id, load
+   std::map<int, double> tasks; // id, load
+   std::unordered_map<int,int> sent_tasks;
 
    const DistBaseLB::LDStats* my_stats;
    std::vector<MigrateInfo*> migrateInfo;
@@ -77,8 +83,10 @@ class DistNeighborsLB : public CBase_DistNeighborsLB {
    void UpdateMinNeighbor(int source, double load);
    void AddToMigrationMessage(int, double, int);
    void LocalRemote(int i, const LDObjid& from, const LDObjid& to);
-   void LoadBalance();
    void GlobalReschedule();
+   void LoadBalance();
+   void SendLoad(int hop);
+   void DesperateLoadBalance();
    void Strategy(const DistBaseLB::LDStats* const stats);
    bool QueryBalanceNow(int step) { return true; };
 };
